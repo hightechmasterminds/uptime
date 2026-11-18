@@ -10,6 +10,10 @@ name: Uptime monitor
 # a full-outage run still finishes in well under 2 minutes.
 # On DOWN it opens — or updates — an incident issue, assigns it to the owner and @mentions
 # them (so they are emailed without watching the repo), and closes it on recovery.
+#
+# A scheduled workflow only begins firing once its cron lands on the default branch AND the
+# branch receives a push; GitHub also disables schedules in public repos after 60 days with no
+# commit. keepalive.yml makes a monthly heartbeat commit to keep this schedule registered.
 
 on:
   schedule:

@@ -1,0 +1,42 @@
+name: Keepalive
+
+# GitHub disables scheduled workflows in a PUBLIC repo after 60 days with no commit.
+# This repo's only purpose is the uptime monitor, so without activity its schedule would
+# silently stop. Once a month this writes a dated heartbeat and commits it, keeping the
+# repo "active" so the monitor's */5 schedule stays registered.
+#
+# The commit is made with the built-in GITHUB_TOKEN. Commits pushed with GITHUB_TOKEN do
+# NOT trigger other workflows (GitHub blocks recursive runs), so the heartbeat keeps the
+# schedule alive without ever firing the monitor. No PAT, no secret.
+
+on:
+  schedule:
+    - cron: '17 3 1 * *'   # 03:17 UTC on the 1st of each month (well inside the 60-day window)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write and commit a dated heartbeat
+        shell: bash {0}
+        run: |
+          set -uo pipefail
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > .keepalive
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .keepalive
+          if git diff --cached --quiet; then
+            echo 'No change to commit (heartbeat already current).'
+            exit 0
+          fi
+          git commit -m 'chore: keepalive heartbeat (keep scheduled workflows enabled)'
+          git push
