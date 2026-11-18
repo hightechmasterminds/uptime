@@ -17,8 +17,25 @@ here is non-sensitive — public hostnames and HTTP status codes only. No secret
 - On recovery: comments "✅ Recovered" and closes the issue.
 
 ## TE drill
-Actions → **Uptime monitor** → **Run workflow**, set `test_url` to a dead URL
-(e.g. `https://class.tutor10x.com/__down_drill__` → 404, or a non-resolving host → 000).
-The drill uses a separate `[uptime-test]` marker, so it opens/closes its **own** drill incident
-and never touches the real `[uptime]` one. Re-run with `test_url` blank to exercise the recovery
-close.
+Actions → **Uptime monitor** → **Run workflow**.
+
+1. **Open a drill incident:** set `test_url` to a dead URL
+   (e.g. `https://class.tutor10x.com/__down_drill__` → 404, or a non-resolving host → 000),
+   leave `test_expect` at `200`. The run goes red and opens a `🔴 [uptime-test]` incident,
+   assigned to `mmotahar` and @mentioning him.
+2. **Close it (recovery):** re-run with `test_url` set to a **working** URL that returns the
+   expected code — e.g. `test_url = https://class.tutor10x.com/`, `test_expect = 200`.
+   Do **not** leave `test_url` blank: a blank run is a *normal* run (real endpoints, the
+   `[uptime]` marker) and would never touch the drill incident. A working URL keeps the run in
+   drill mode (`[uptime-test]` marker), so it finds the drill incident, comments "✅ Recovered"
+   and closes it.
+
+The `[uptime-test]` marker is separate from the live `[uptime]` marker, so a drill opens/closes
+its **own** incident and never collides with a real one.
+
+## Keepalive
+GitHub disables scheduled workflows in a public repo after 60 days with no commit. `keepalive.yml`
+runs once a month (`cron: 17 3 1 * *`) and commits a dated `.keepalive` heartbeat using the
+built-in `GITHUB_TOKEN`, keeping the repo active so the monitor's `*/5` schedule stays registered.
+Commits made with `GITHUB_TOKEN` don't trigger other workflows, so the heartbeat never fires the
+monitor. No PAT, no secret.
