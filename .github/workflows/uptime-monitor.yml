@@ -1,0 +1,142 @@
+name: Uptime monitor
+
+# Off-VM uptime monitor for Tutor10x (ops#209 prevention #1).
+# PUBLIC repo on purpose: standard-runner minutes are free here, and the endpoints are
+# public (hostnames + HTTP codes only — nothing sensitive is ever written to an issue).
+# Runs on GitHub's infra, so it still alerts when the Tutor10x VM itself is down.
+#
+# Every ~5 min it probes the public endpoints in parallel. An endpoint must fail in BOTH
+# rounds (a second round ~10s later) to count as DOWN, so a single blip doesn't page, and
+# a full-outage run still finishes in well under 2 minutes.
+# On DOWN it opens — or updates — an incident issue, assigns it to the owner and @mentions
+# them (so they are emailed without watching the repo), and closes it on recovery.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes (GitHub's minimum; may be delayed under load)
+  workflow_dispatch:
+    inputs:
+      test_url:
+        description: 'Dead/test URL to probe instead of the real endpoints (TE drill). Blank = normal run.'
+        required: false
+        default: ''
+      test_expect:
+        description: 'Expected HTTP code for test_url'
+        required: false
+        default: '200'
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: uptime-monitor
+  cancel-in-progress: false
+
+env:
+  INCIDENT_REPO: ${{ github.repository }}   # file incidents here (self-repo, built-in token, no secret)
+  NOTIFY_LOGIN: mmotahar                     # assigned + @mentioned on every incident
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe endpoints and manage the incident issue
+        shell: bash {0}            # no -e: we handle every exit status explicitly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_URL: ${{ github.event.inputs.test_url }}
+          TEST_EXPECT: ${{ github.event.inputs.test_expect }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          dir=$(mktemp -d)
+
+          if [ -n "${TEST_URL:-}" ]; then
+            MARKER='[uptime-test]'
+            CHECKS=( "test|${TEST_URL}|${TEST_EXPECT:-200}" )
+            echo "TE DRILL mode — probing only: ${TEST_URL} (expect ${TEST_EXPECT:-200})"
+          else
+            MARKER='[uptime]'
+            CHECKS=(
+              "class|https://class.tutor10x.com/|200"
+              "chat|https://chat.tutor10x.com/health|200"
+              "wil|https://wil.tutor10x.com/|200"
+              "appversion|https://memory.tutor10x.com/appversion|200"
+              "apex|https://tutor10x.com/|301"
+            )
+          fi
+
+          # Probe every "label|url|want" in a list file IN PARALLEL; records <label>.code and <label>.st
+          probe_set() {
+            while IFS='|' read -r label url want; do
+              [ -z "$label" ] && continue
+              (
+                code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 "$url" 2>/dev/null || true)
+                echo "${code:-000}" > "$dir/$label.code"
+                if [ "$code" = "$want" ]; then echo ok > "$dir/$label.st"; else echo fail > "$dir/$label.st"; fi
+              ) &
+            done < "$1"
+            wait
+          }
+
+          : > "$dir/round1.list"
+          for c in "${CHECKS[@]}"; do echo "$c" >> "$dir/round1.list"; done
+
+          # Round 1 (all), then Round 2 (only round-1 failures) after a short pause
+          probe_set "$dir/round1.list"
+          : > "$dir/round2.list"
+          while IFS='|' read -r label url want; do
+            [ -z "$label" ] && continue
+            [ "$(cat "$dir/$label.st" 2>/dev/null)" = "fail" ] && echo "$label|$url|$want" >> "$dir/round2.list"
+          done < "$dir/round1.list"
+          if [ -s "$dir/round2.list" ]; then sleep 10; probe_set "$dir/round2.list"; fi
+
+          # DOWN = failed both rounds
+          DOWN=""
+          while IFS='|' read -r label url want; do
+            [ -z "$label" ] && continue
+            st=$(cat "$dir/$label.st" 2>/dev/null)
+            code=$(cat "$dir/$label.code" 2>/dev/null)
+            if [ "$st" = "fail" ]; then
+              echo "DOWN  $label  $url  (got ${code:-000}, want $want)"
+              DOWN="${DOWN}- \`${label}\` ${url} -> got \`${code:-000}\`, expected \`${want}\`"$'\n'
+            else
+              echo "ok    $label  $url  (${code:-?})"
+            fi
+          done < "$dir/round1.list"
+
+          # Labels (idempotent)
+          gh label create incident --repo "$INCIDENT_REPO" --color B60205 --description "Live incident" 2>/dev/null || true
+          gh label create uptime   --repo "$INCIDENT_REPO" --color 1D76DB --description "Automated uptime monitor" 2>/dev/null || true
+
+          # Open incident for THIS marker, if any
+          OPEN=$(gh issue list --repo "$INCIDENT_REPO" --label incident --state open --limit 50 \
+                   --json number,title --jq "[.[]|select(.title|contains(\"$MARKER\"))][0].number // empty")
+          TS=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+          if [ -n "$DOWN" ]; then
+            if [ -z "$OPEN" ]; then
+              echo "Opening incident in $INCIDENT_REPO"
+              URL=$(gh issue create --repo "$INCIDENT_REPO" \
+                --title "🔴 $MARKER Tutor10x endpoint(s) down" \
+                --label incident --label uptime \
+                --body "$(printf '@%s — **%s endpoint check FAILED** (two probe rounds)\n\n%s\nDetected: %s\nRun: %s\n' "$NOTIFY_LOGIN" "$MARKER" "$DOWN" "$TS" "$RUN_URL")")
+              num=$(echo "$URL" | grep -oE '[0-9]+$')
+              [ -n "$num" ] && gh issue edit "$num" --repo "$INCIDENT_REPO" --add-assignee "$NOTIFY_LOGIN" 2>/dev/null || true
+            else
+              echo "Updating incident #$OPEN"
+              gh issue comment "$OPEN" --repo "$INCIDENT_REPO" \
+                --body "$(printf '@%s still down at %s\n\n%s\nRun: %s' "$NOTIFY_LOGIN" "$TS" "$DOWN" "$RUN_URL")"
+            fi
+            exit 1
+          else
+            if [ -n "$OPEN" ]; then
+              echo "Recovered — closing incident #$OPEN"
+              gh issue comment "$OPEN" --repo "$INCIDENT_REPO" \
+                --body "$(printf '✅ Recovered — all %s endpoints returning expected codes at %s.\nRun: %s' "$MARKER" "$TS" "$RUN_URL")"
+              gh issue close "$OPEN" --repo "$INCIDENT_REPO" --reason completed
+            else
+              echo "All endpoints healthy; no open incident."
+            fi
+          fi
